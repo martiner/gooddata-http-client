@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2007-2013, GoodData(R) Corporation. All rights reserved.
+ * Copyright (C) 2007-2014, GoodData(R) Corporation. All rights reserved.
  * This program is made available under the terms of the BSD License.
  */
 package com.gooddata.http.client;
@@ -34,6 +34,8 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import static org.apache.commons.lang.Validate.notNull;
 
 /**
  * <p>Http client with ability to handle GoodData authentication.</p>
@@ -81,6 +83,9 @@ public class GoodDataHttpClient implements HttpClient {
     private static final String TOKEN_URL = "/gdc/account/token";
     public static final String COOKIE_GDC_AUTH_TT = "cookie=GDCAuthTT";
     public static final String COOKIE_GDC_AUTH_SST = "cookie=GDCAuthSST";
+    public static final String SST_HEADER = "X-GDC-AuthSST";
+    public static final String TT_HEADER = "X-GDC-AuthTT";
+    public static final String TT_ENTITY = "userToken";
     public static final String LOCK_RW = "gooddata.lock.rw";
     public static final String LOCK_AUTH = "gooddata.lock.auth";
 
@@ -92,17 +97,30 @@ public class GoodDataHttpClient implements HttpClient {
 
     private final HttpClient httpClient;
 
+    private final HttpHost httpHost;
+
     private final SSTRetrievalStrategy sstStrategy;
 
     private final HttpContext context;
 
+    // current SST (or null if not yet obtained)
+    private String sst;
+    // TT to be set into the header (or null if TT not yet obtained)
+    private String tt;
+
+
     /**
      * Construct object.
      * @param httpClient Http client
+     * @param httpHost http host
      * @param sstStrategy super-secure token (SST) obtaining strategy
      */
-    public GoodDataHttpClient(final HttpClient httpClient, final SSTRetrievalStrategy sstStrategy) {
+    public GoodDataHttpClient(final HttpClient httpClient, final HttpHost httpHost, final SSTRetrievalStrategy sstStrategy) {
+        notNull(httpClient);
+        notNull(httpHost, "HTTP host cannot be null");
+        notNull(sstStrategy);
         this.httpClient = httpClient;
+        this.httpHost = httpHost;
         this.sstStrategy = sstStrategy;
         context = new BasicHttpContext();
         final CookieStore cookieStore = new BasicCookieStore();
@@ -117,10 +135,11 @@ public class GoodDataHttpClient implements HttpClient {
 
     /**
      * Construct object.
+     * @param httpHost http host
      * @param sstStrategy super-secure token (SST) obtaining strategy
      */
-    public GoodDataHttpClient(final SSTRetrievalStrategy sstStrategy) {
-        this(HttpClientBuilder.create().build(), sstStrategy);
+    public GoodDataHttpClient(final HttpHost httpHost, final SSTRetrievalStrategy sstStrategy) {
+        this(HttpClientBuilder.create().build(), httpHost, sstStrategy);
     }
 
     private GoodDataChallengeType identifyGoodDataChallenge(final HttpResponse response) {
@@ -148,7 +167,7 @@ public class GoodDataHttpClient implements HttpClient {
         EntityUtils.consume(originalResponse.getEntity());
 
         final Lock authLock = (Lock) context.getAttribute(LOCK_AUTH);
-        final boolean entered = authLock != null ? authLock.tryLock() : true;
+        final boolean entered = authLock == null || authLock.tryLock();
 
         if (entered) {
             try {
@@ -162,14 +181,13 @@ public class GoodDataHttpClient implements HttpClient {
                 boolean doSST = true;
                 try {
                     if (challenge == GoodDataChallengeType.TT) {
-                        if (this.refreshTt(httpHost)) {
+                        if (refreshTt()) {
                             doSST = false;
                         }
                     }
                     if (doSST) {
-                        final String sst = sstStrategy.obtainSst();
-                        CookieUtils.replaceSst(sst, context, httpHost.getHostName());
-                        if (!refreshTt(httpHost)) {
+                        sst = sstStrategy.obtainSst(httpClient, httpHost);
+                        if (!refreshTt()) {
                             throw new GoodDataAuthException("Unable to obtain TT after successfully obtained SST");
                         }
                     }
@@ -192,7 +210,6 @@ public class GoodDataHttpClient implements HttpClient {
 
     /**
      * Refresh temporary token.
-     * @param httpHost HTTP host
      * @return
      * <ul>
      *     <li><code>true</code> TT refresh successful</li>
@@ -200,14 +217,17 @@ public class GoodDataHttpClient implements HttpClient {
      * </ul>
      * @throws GoodDataAuthException error
      */
-    private boolean refreshTt(final HttpHost httpHost) throws IOException {
+    private boolean refreshTt() throws IOException {
         log.debug("Obtaining TT");
+
         final HttpGet getTT = new HttpGet(TOKEN_URL);
+        getTT.addHeader(SST_HEADER, sst);
         try {
             final HttpResponse response = httpClient.execute(httpHost, getTT, context);
             final int status = response.getStatusLine().getStatusCode();
             switch (status) {
                 case HttpStatus.SC_OK:
+                    tt = TokenUtils.extractTokenFromBody(response, TT_ENTITY);
                     return true;
                 case HttpStatus.SC_UNAUTHORIZED:
                     return false;
@@ -219,11 +239,13 @@ public class GoodDataHttpClient implements HttpClient {
         }
     }
 
+    @SuppressWarnings("deprecation")
     @Override
     public HttpParams getParams() {
         return httpClient.getParams();
     }
 
+    @SuppressWarnings("deprecation")
     @Override
     public ClientConnectionManager getConnectionManager() {
         return httpClient.getConnectionManager();
@@ -280,6 +302,11 @@ public class GoodDataHttpClient implements HttpClient {
         if (rwLock != null) {
             readLock = rwLock.readLock();
             readLock.lock();
+        }
+
+        if (tt != null) {
+            // need to send TT in the header
+            request.addHeader(TT_HEADER, tt);//todo this leaks tt to every server
         }
 
         final HttpResponse resp;
